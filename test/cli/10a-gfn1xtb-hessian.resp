@@ -1,0 +1,6 @@
+run
+--no-restart
+$ORIGIN/10-water.xyz
+--method
+gfn1
+--freq

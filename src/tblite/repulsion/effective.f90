@@ -1,0 +1,338 @@
+! This file is part of tblite.
+! SPDX-Identifier: LGPL-3.0-or-later
+!
+! tblite is free software: you can redistribute it and/or modify it under
+! the terms of the GNU Lesser General Public License as published by
+! the Free Software Foundation, either version 3 of the License, or
+! (at your option) any later version.
+!
+! tblite is distributed in the hope that it will be useful,
+! but WITHOUT ANY WARRANTY; without even the implied warranty of
+! MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+! GNU Lesser General Public License for more details.
+!
+! You should have received a copy of the GNU Lesser General Public License
+! along with tblite.  If not, see <https://www.gnu.org/licenses/>.
+
+!> @file tblite/repulsion/effective.f90
+!> Provides a screened Coulomb repulsion interaction
+
+!> Classical repulsion interaction as used with the xTB Hamiltonian
+module tblite_repulsion_effective
+   use mctc_env, only : wp
+   use mctc_io, only : structure_type
+   use tblite_container, only : container_cache
+   use tblite_cutoff, only : get_lattice_points
+   use tblite_partition, only : work_partition, owns_pair
+   use tblite_repulsion_type, only : repulsion_type
+   implicit none
+   private
+
+   public :: new_repulsion
+
+
+   !> Container to evaluate classical repulsion interactions for the xTB Hamiltonian
+   type, public, extends(repulsion_type) :: tb_repulsion
+      !> Exponent for the repulsion interaction
+      real(wp), allocatable :: alpha(:, :)
+      !> Effective nuclear charge
+      real(wp), allocatable :: zeff(:, :)
+      !> Scaling of the repulsion exponents
+      real(wp), allocatable :: kexp(:, :)
+      !> Exponent of the repulsion polynomial
+      real(wp), allocatable :: rexp(:, :)
+      !> Real-space cutoff
+      real(wp) :: cutoff = 25.0_wp
+   contains
+      procedure :: get_engrad
+      procedure :: get_hessian
+   end type tb_repulsion
+
+   character(len=*), parameter :: label = "screened Coulomb repulsion"
+
+contains
+
+
+subroutine new_repulsion(self, mol, alpha, zeff, kexp, kexp_light, rexp, cutoff)
+   !> Instance of the repulsion container
+   type(tb_repulsion), intent(out) :: self
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+   !> Exponent for the repulsion interaction
+   real(wp), intent(in) :: alpha(:)
+   !> Effective nuclear charge
+   real(wp), intent(in) :: zeff(:)
+   !> Scaling of the repulsion exponents
+   real(wp), intent(in) :: kexp
+   !> Scaling of the repulsion exponents for light atom pairs
+   real(wp), intent(in) :: kexp_light
+   !> Exponent of the repulsion polynomial
+   real(wp), intent(in) :: rexp
+   !> Real-space cutoff
+   real(wp), intent(in), optional :: cutoff
+
+   integer :: isp, izp, jsp, jzp
+
+   self%label = label
+   allocate(self%alpha(mol%nid, mol%nid))
+   do isp = 1, mol%nid
+      do jsp = 1, mol%nid
+         self%alpha(jsp, isp) = sqrt(alpha(isp)*alpha(jsp))
+      end do
+   end do
+
+   allocate(self%zeff(mol%nid, mol%nid))
+   do isp = 1, mol%nid
+      do jsp = 1, mol%nid
+         self%zeff(jsp, isp) = zeff(isp)*zeff(jsp)
+      end do
+   end do
+
+   allocate(self%kexp(mol%nid, mol%nid))
+   do isp = 1, mol%nid
+      izp = mol%num(isp)
+      do jsp = 1, mol%nid
+         jzp = mol%num(jsp)
+         self%kexp(jsp, isp) = merge(kexp, kexp_light, izp > 2 .or. jzp > 2)
+      end do
+   end do
+
+   allocate(self%rexp(mol%nid, mol%nid))
+   self%rexp(:, :) = rexp
+   if (present(cutoff)) self%cutoff = cutoff
+
+end subroutine new_repulsion
+
+
+!> Evaluate classical interaction for energy and derivatives
+subroutine get_engrad(self, mol, cache, energies, gradient, sigma)
+   !> Instance of the repulsion container
+   class(tb_repulsion), intent(in) :: self
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+   !> Cached data between different runs
+   type(container_cache), intent(inout) :: cache
+   !> Repulsion energy
+   real(wp), intent(inout) :: energies(:)
+   !> Molecular gradient of the repulsion energy
+   real(wp), contiguous, intent(inout), optional :: gradient(:, :)
+   !> Strain derivatives of the repulsion energy
+   real(wp), contiguous, intent(inout), optional :: sigma(:, :)
+
+   real(wp), allocatable :: trans(:, :)
+
+   call get_lattice_points(mol%periodic, mol%lattice, self%cutoff, trans)
+
+   if (present(gradient) .and. present(sigma)) then
+      call get_repulsion_derivs(mol, trans, self%cutoff, self%alpha, self%zeff, &
+         & self%kexp, self%rexp, energies, gradient, sigma, self%partition)
+   else
+      call get_repulsion_energy(mol, trans, self%cutoff, self%alpha, self%zeff, &
+         & self%kexp, self%rexp, energies, self%partition)
+   end if
+
+end subroutine get_engrad
+
+
+!> Evaluate the analytic Cartesian Hessian of the repulsion energy
+subroutine get_hessian(self, mol, hessian)
+   class(tb_repulsion), intent(in) :: self
+   type(structure_type), intent(in) :: mol
+   real(wp), intent(inout) :: hessian(:, :)
+
+   real(wp), allocatable :: trans(:, :)
+
+   call get_lattice_points(mol%periodic, mol%lattice, self%cutoff, trans)
+   call get_repulsion_hessian(mol, trans, self%cutoff, self%alpha, self%zeff, &
+      & self%kexp, self%rexp, hessian, self%partition)
+end subroutine get_hessian
+
+
+subroutine get_repulsion_energy(mol, trans, cutoff, alpha, zeff, kexp, rexp, &
+      & energies, partition)
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+   !> Lattice points
+   real(wp), intent(in) :: trans(:, :)
+   !> Real space cutoff
+   real(wp), intent(in) :: cutoff
+   !> Exponents for all element pairs
+   real(wp), intent(in) :: alpha(:, :)
+   !> Effective nuclear charges for all element pairs
+   real(wp), intent(in) :: zeff(:, :)
+   !> Pairwise parameters for all element pairs
+   real(wp), intent(in) :: kexp(:, :)
+   !> Pairwise parameters for all element pairs
+   real(wp), intent(in) :: rexp(:, :)
+   !> Repulsion energy
+   real(wp), intent(inout) :: energies(:)
+   !> Share of the atom pairs evaluated here, absent selects the complete work
+   type(work_partition), intent(in), optional :: partition
+
+   integer :: iat, jat, izp, jzp, itr
+   real(wp) :: r1, r2, rij(3), r1k, r1r, exa, cutoff2, dE
+
+   cutoff2 = cutoff**2
+
+   !$omp parallel do default(none) schedule(runtime) reduction(+:energies) &
+   !$omp shared(mol, trans, cutoff2, kexp, rexp, alpha, zeff, partition) &
+   !$omp private(iat, jat, izp, jzp, itr, r1, r2, rij, r1k, r1r, exa, dE)
+   do iat = 1, mol%nat
+      izp = mol%id(iat)
+      do jat = 1, iat
+         if (.not.owns_pair(partition, iat, jat)) cycle
+         jzp = mol%id(jat)
+         do itr = 1, size(trans, dim=2)
+            rij = mol%xyz(:, iat) - mol%xyz(:, jat) - trans(:, itr)
+            r2 = sum(rij**2)
+            if (r2 > cutoff2 .or. r2 < 1.0e-12_wp) cycle
+            r1 = sqrt(r2)
+
+            r1k = r1**kexp(jzp, izp)
+            exa = exp(-alpha(jzp, izp)*r1k)
+            r1r = r1**rexp(jzp, izp)
+            dE = zeff(jzp, izp) * exa/r1r
+            energies(iat) = energies(iat) + 0.5_wp * dE
+            if (iat /= jat) then
+               energies(jat) = energies(jat) + 0.5_wp * dE
+            end if
+         end do
+      end do
+   end do
+
+end subroutine get_repulsion_energy
+
+
+subroutine get_repulsion_derivs(mol, trans, cutoff, alpha, zeff, kexp, rexp, &
+      & energies, gradient, sigma, partition)
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+   !> Lattice points
+   real(wp), intent(in) :: trans(:, :)
+   !> Real space cutoff
+   real(wp), intent(in) :: cutoff
+   !> Exponents for all element pairs
+   real(wp), intent(in) :: alpha(:, :)
+   !> Effective nuclear charges for all element pairs
+   real(wp), intent(in) :: zeff(:, :)
+   !> Pairwise parameters for all element pairs
+   real(wp), intent(in) :: kexp(:, :)
+   !> Pairwise parameters for all element pairs
+   real(wp), intent(in) :: rexp(:, :)
+   !> Repulsion energy
+   real(wp), intent(inout) :: energies(:)
+   !> Molecular gradient of the repulsion energy
+   real(wp), intent(inout) :: gradient(:, :)
+   !> Strain derivatives of the repulsion energy
+   real(wp), intent(inout) :: sigma(:, :)
+   !> Share of the atom pairs evaluated here, absent selects the complete work
+   type(work_partition), intent(in), optional :: partition
+
+   integer :: iat, jat, izp, jzp, itr
+   real(wp) :: r1, r2, rij(3), r1k, r1r, exa, cutoff2, dE, dG(3), dS(3, 3)
+
+   cutoff2 = cutoff**2
+
+   !$omp parallel do default(none) schedule(runtime) reduction(+:energies, gradient, sigma) &
+   !$omp shared(mol, trans, cutoff2, kexp, rexp, alpha, zeff, partition) &
+   !$omp private(iat, jat, izp, jzp, itr, r1, r2, rij, r1k, r1r, exa, dE, dG, dS)
+   do iat = 1, mol%nat
+      izp = mol%id(iat)
+      do jat = 1, iat
+         if (.not.owns_pair(partition, iat, jat)) cycle
+         jzp = mol%id(jat)
+         do itr = 1, size(trans, dim=2)
+            rij = mol%xyz(:, iat) - mol%xyz(:, jat) - trans(:, itr)
+            r2 = sum(rij**2)
+            if (r2 > cutoff2 .or. r2 < 1.0e-12_wp) cycle
+            r1 = sqrt(r2)
+
+            r1k = r1**kexp(jzp, izp)
+            exa = exp(-alpha(jzp, izp)*r1k)
+            r1r = r1**rexp(jzp, izp)
+            dE = zeff(jzp, izp) * exa/r1r
+            dG = -(alpha(jzp, izp)*r1k*kexp(jzp, izp) + rexp(jzp, izp)) * dE * rij/r2
+            dS = spread(dG, 1, 3) * spread(rij, 2, 3)
+            energies(iat) = energies(iat) + 0.5_wp * dE
+            if (iat /= jat) then
+               energies(jat) = energies(jat) + 0.5_wp * dE
+               gradient(:, iat) = gradient(:, iat) + dG
+               gradient(:, jat) = gradient(:, jat) - dG
+               sigma(:, :) = sigma + dS
+            else
+               sigma(:, :) = sigma + 0.5_wp * dS
+            end if
+         end do
+      end do
+   end do
+
+end subroutine get_repulsion_derivs
+
+
+!> Analytic Cartesian Hessian of the screened pair repulsion
+subroutine get_repulsion_hessian(mol, trans, cutoff, alpha, zeff, kexp, rexp, &
+      & hessian, partition)
+   type(structure_type), intent(in) :: mol
+   real(wp), intent(in) :: trans(:, :)
+   real(wp), intent(in) :: cutoff
+   real(wp), intent(in) :: alpha(:, :)
+   real(wp), intent(in) :: zeff(:, :)
+   real(wp), intent(in) :: kexp(:, :)
+   real(wp), intent(in) :: rexp(:, :)
+   real(wp), intent(inout) :: hessian(:, :)
+   type(work_partition), intent(in), optional :: partition
+
+   integer :: iat, jat, izp, jzp, itr, ic, jc, ii, jj
+   real(wp) :: r1, r2, rij(3), r1k, r1r, exa, cutoff2, dE
+   real(wp) :: qfac, dEdr, d2Edr2, radial, block(3, 3), unit(3)
+
+   cutoff2 = cutoff**2
+
+   do iat = 1, mol%nat
+      izp = mol%id(iat)
+      do jat = 1, iat - 1
+         if (.not.owns_pair(partition, iat, jat)) cycle
+         jzp = mol%id(jat)
+         do itr = 1, size(trans, dim=2)
+            rij = mol%xyz(:, iat) - mol%xyz(:, jat) - trans(:, itr)
+            r2 = dot_product(rij, rij)
+            if (r2 > cutoff2 .or. r2 < 1.0e-12_wp) cycle
+            r1 = sqrt(r2)
+
+            r1k = r1**kexp(jzp, izp)
+            exa = exp(-alpha(jzp, izp)*r1k)
+            r1r = r1**rexp(jzp, izp)
+            dE = zeff(jzp, izp)*exa/r1r
+
+            qfac = alpha(jzp, izp)*kexp(jzp, izp)*r1k + rexp(jzp, izp)
+            dEdr = -qfac*dE/r1
+            d2Edr2 = dE*(qfac*qfac + qfac &
+               & - alpha(jzp, izp)*kexp(jzp, izp)**2*r1k)/r2
+
+            unit = rij/r1
+            radial = dEdr/r1
+            do ic = 1, 3
+               do jc = 1, 3
+                  block(ic, jc) = (d2Edr2 - radial)*unit(ic)*unit(jc)
+               end do
+               block(ic, ic) = block(ic, ic) + radial
+            end do
+
+            do ic = 1, 3
+               ii = 3*(iat - 1) + ic
+               do jc = 1, 3
+                  jj = 3*(jat - 1) + jc
+                  hessian(ii, 3*(iat - 1) + jc) = hessian(ii, 3*(iat - 1) + jc) + block(ic, jc)
+                  hessian(3*(jat - 1) + ic, jj) = hessian(3*(jat - 1) + ic, jj) + block(ic, jc)
+                  hessian(ii, jj) = hessian(ii, jj) - block(ic, jc)
+                  hessian(3*(jat - 1) + ic, 3*(iat - 1) + jc) = &
+                     & hessian(3*(jat - 1) + ic, 3*(iat - 1) + jc) - block(ic, jc)
+               end do
+            end do
+         end do
+      end do
+   end do
+end subroutine get_repulsion_hessian
+
+
+end module tblite_repulsion_effective

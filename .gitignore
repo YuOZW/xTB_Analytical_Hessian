@@ -1,0 +1,131 @@
+# =============================================================================
+# tblite / GFN1-xTB analytic Hessian development
+# =============================================================================
+
+# --- Compiled objects and libraries ------------------------------------------------
+*.o
+*.obj
+*.lo
+*.slo
+*.a
+*.la
+*.lai
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.dll.a
+*.exe
+*.out
+*.app
+
+# Fortran compiler outputs
+*.mod
+*.smod
+*.d
+
+# Precompiled headers
+*.gch
+*.pch
+
+# --- Build systems -----------------------------------------------------------------
+# CMake out-of-source builds
+/build/
+/build-*/
+/cmake-build-*/
+/CMakeFiles/
+/CMakeCache.txt
+/cmake_install.cmake
+/CTestTestfile.cmake
+/Testing/
+/compile_commands.json
+/install_manifest.txt
+
+# Meson
+/meson-build/
+/builddir/
+/meson-logs/
+/meson-private/
+/meson-info/
+
+# Fortran Package Manager
+/.fpm/
+/fpm_build/
+
+# Ninja / Make
+.ninja_deps
+.ninja_log
+Makefile.local
+
+# --- Python ------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Python packaging
+/dist/
+*.whl
+/.wheel-build/
+/.venv-wheel/
+/.venv-install/
+/python/build/
+/python/dist/
+/python/*.egg-info/
+/python/.eggs/
+*.egg-info/
+.eggs/
+wheelhouse/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# --- Documentation -----------------------------------------------------------------
+/doc/_build/
+/doc/build/
+
+# --- Local IDE/editor files ---------------------------------------------------------
+.vscode/
+.idea/
+*.code-workspace
+*.swp
+*.swo
+*~
+
+# --- OS metadata -------------------------------------------------------------------
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# --- Profiling / debugging ----------------------------------------------------------
+gmon.out
+perf.data
+perf.data.old
+*.gcda
+*.gcno
+*.gcov
+*.profraw
+*.profdata
+
+# --- Temporary/local files ----------------------------------------------------------
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+.cache/
+
+# Do NOT blanket-ignore *.json, *.xyz, *.log, or *.tag.
+# The repository contains tracked validation/reference data with these extensions.

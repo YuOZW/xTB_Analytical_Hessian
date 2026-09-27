@@ -1,0 +1,10 @@
+# Build-time tools for local Meson wheel generation.
+build>=1.2
+meson-python>=0.16
+meson>=1.4,!=1.8.0
+ninja>=1.11
+cffi>=1.16
+setuptools>=68
+
+# Windows wheel DLL vendoring/repair
+delvewheel

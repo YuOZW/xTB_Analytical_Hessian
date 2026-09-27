@@ -1,0 +1,1204 @@
+! This file is part of tblite.
+! SPDX-Identifier: LGPL-3.0-or-later
+!
+! tblite is free software: you can redistribute it and/or modify it under
+! the terms of the GNU Lesser General Public License as published by
+! the Free Software Foundation, either version 3 of the License, or
+! (at your option) any later version.
+!
+! tblite is distributed in the hope that it will be useful,
+! but WITHOUT ANY WARRANTY; without even the implied warranty of
+! MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+! GNU Lesser General Public License for more details.
+!
+! You should have received a copy of the GNU Lesser General Public License
+! along with tblite.  If not, see <https://www.gnu.org/licenses/>.
+
+!> @file tblite/solvation/alpb.f90
+!> Provides the analytical linearized Poission-Boltzmann model.
+
+!> Analytical linearized Poisson-Boltzmann implicit solvation model.
+!>
+!> Implements a reaction field model of the Generalized Born type.
+module tblite_solvation_alpb
+   use mctc_env, only : wp, error_type, fatal_error
+   use mctc_io, only : structure_type
+   use mctc_io_constants, only : pi
+   use mctc_io_math, only : matdet_3x3, matinv_3x3
+   use tblite_blas, only : dot, gemv, symv
+   use tblite_container_cache, only : container_cache
+   use tblite_mesh_lebedev, only : grid_size, get_angular_grid, list_bisection
+   use tblite_partition, only : work_partition, owns_index, owns_pair
+   use tblite_scf_info, only : scf_info, atom_resolved
+   use tblite_scf_potential, only : potential_type
+   use tblite_solvation_born, only : born_integrator, new_born_integrator
+   use tblite_solvation_hyperdual
+   use tblite_solvation_cm5, only : get_cm5_charges
+   use tblite_solvation_data, only : get_vdw_rad_cosmo
+   use tblite_solvation_type, only : solvation_type
+   use tblite_wavefunction_type, only : wavefunction_type
+   implicit none
+   private
+
+   public :: new_alpb
+   public :: born_kernel
+
+
+   !> Possible Born interaction kernels
+   type :: enum_born_kernel
+      !> Classical Still kernel
+      integer :: still = 1
+      !> P16 kernel by Lange (JCTC 2012, 8, 1999-2011)
+      integer :: p16 = 2
+   end type enum_born_kernel
+
+   !> Actual enumerator for the generalized Born kernels
+   type(enum_born_kernel), parameter :: born_kernel = enum_born_kernel()
+
+
+   !> Input for ALPB solvation
+   type, public :: alpb_input
+      !> Dielectric constant
+      real(wp) :: dielectric_const
+      !> Scaling factor for Born radii
+      real(wp) :: born_scale = 1.0_wp
+      !> Offset parameter for Born radii integration
+      real(wp) :: born_offset = 0.0_wp
+      !> Van-der-Waals radii for all species
+      real(wp), allocatable :: rvdw(:)
+      !> Dielectric descreening parameter
+      real(wp), allocatable :: descreening(:)
+      !> Interaction kernel
+      integer :: kernel = born_kernel%p16
+      !> Use analytical linearized Poisson-Boltzmann model
+      logical :: alpb = .true.
+      !> Solvent for parameter selection
+      character(len=:), allocatable :: solvent
+   end type alpb_input
+
+   !> Provide constructor for ALPB input
+   interface alpb_input
+      module procedure :: create_alpb_input
+   end interface alpb_input
+
+   !> Definition of ALPB/GBSA model
+   type, public, extends(solvation_type) :: alpb_solvation
+      !> Dielectric function
+      real(wp) :: keps
+      !> Analytical linearized Poisson-Boltzmann constant
+      real(wp) :: alpbet
+      !> Integrator for Born radii
+      type(born_integrator) :: gbobc
+      !> Interaction kernel
+      integer :: kernel
+      !> Use CM5 charges (GFN1-xTB compatibility)
+      logical :: useCM5 = .false.
+   contains
+      !> Update cache from container
+      procedure :: update
+      !> Return dependency on density
+      procedure :: variable_info
+      !> Get solvation energy
+      procedure :: get_energy
+      !> Get solvation potential
+      procedure :: get_potential
+      !> Get explicit geometry derivative of the solvation potential
+      procedure :: get_potential_gradient
+      !> Get solvation gradient
+      procedure :: get_gradient
+      !> Get analytic Cartesian Hessian
+      procedure :: get_interaction_hessian
+   end type alpb_solvation
+
+   !> Provide constructor for ALPB solvation
+   interface alpb_solvation
+      module procedure :: create_alpb
+   end interface alpb_solvation
+
+
+   !> Restart data for ALPB calculation
+   type :: alpb_cache
+      !> Screening matrix
+      real(wp), allocatable :: jmat(:, :)
+      !> Scratch array for screening potential intermediates
+      real(wp), allocatable :: vat(:)
+      !> Born radii
+      real(wp), allocatable :: rad(:)
+      !> Derivatives of Born radii w.r.t. cartesian displacements
+      real(wp), allocatable :: draddr(:, :, :)
+      !> Scratch workspace for gradient construction
+      real(wp), allocatable :: scratch(:)
+      !> Workspace for atomic charges
+      real(wp), allocatable :: qscratch(:)
+      !> CM5 charges (only required for GFN1 compatibility)
+      real(wp), allocatable :: cm5(:)
+      !> CM5 charge derivatives
+      real(wp), allocatable :: dcm5dr(:,:,:)
+   end type alpb_cache
+
+
+   !> Identifier for container
+   character(len=*), parameter :: label = "alpb/gbsa reaction field model"
+
+   real(wp), parameter :: zetaP16 = 1.028_wp
+   real(wp), parameter :: zetaP16o16 = zetaP16 / 16.0_wp
+   real(wp), parameter :: alpha_alpb = 0.571412_wp
+
+
+contains
+
+
+!> Consturctor for ALPB input to properly assign allocatable strings
+function create_alpb_input(dielectric_const, solvent, alpb, kernel) result(self)
+   !> Dielectric constant
+   real(wp), intent(in) :: dielectric_const
+   !> Solvent for parameter selection
+   character(len=*), intent(in), optional :: solvent
+   !> Use analytical linearized Poisson-Boltzmann model
+   logical, intent(in), optional :: alpb
+   !> Interaction kernel
+   integer, intent(in), optional :: kernel
+
+   type(alpb_input) :: self
+
+   self%dielectric_const = dielectric_const
+
+   if (present(solvent)) then
+      self%solvent = solvent
+   end if
+
+   if (present(alpb)) then
+      self%alpb = alpb
+   end if
+
+   if (present(kernel)) then
+      self%kernel = kernel
+   end if
+
+end function create_alpb_input
+
+
+!> Create new ALPB solvation model
+subroutine new_alpb(self, mol, input, method)
+   !> Instance of the solvation model
+   type(alpb_solvation), intent(out) :: self
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+   !> Input for ALPB solvation
+   type(alpb_input), intent(in) :: input
+   !> Method for parameter selection
+   character(len=*), intent(in), optional :: method
+
+   real(wp), allocatable :: rvdw(:)
+
+   self%label = label
+   self%alpbet = merge(alpha_alpb / input%dielectric_const, 0.0_wp, input%alpb)
+   self%keps = (1.0_wp/input%dielectric_const - 1.0_wp) / (1.0_wp + self%alpbet)
+   self%kernel = input%kernel
+   if (allocated(input%solvent) .and. present(method)) then
+      self%useCM5 = trim(method) == "gfn1"
+   end if
+
+   if (allocated(input%rvdw)) then
+      rvdw = input%rvdw
+   else
+      rvdw = get_vdw_rad_cosmo(mol%num)
+   end if
+
+   call new_born_integrator(self%gbobc, mol, rvdw, descreening=input%descreening, &
+      & born_scale=input%born_scale, born_offset=input%born_offset)
+end subroutine new_alpb
+
+
+!> Type constructor for ALPB solvation
+function create_alpb(mol, input, method) result(self)
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+   !> Input for ALPB solvation
+   type(alpb_input), intent(in) :: input
+   !> Method for parameter selection
+   character(len=*), intent(in), optional :: method
+   !> Instance of the solvation model
+   type(alpb_solvation) :: self
+
+   call new_alpb(self, mol, input, method)
+end function create_alpb
+
+
+!> Update cache from container
+subroutine update(self, mol, cache)
+   !> Instance of the solvation model
+   class(alpb_solvation), intent(in) :: self
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+   !> Reusable data container
+   type(container_cache), intent(inout) :: cache
+
+   type(alpb_cache), pointer :: ptr
+   real(wp) :: adet
+
+   call taint(cache, ptr)
+
+   if (.not.allocated(ptr%jmat)) then
+      allocate(ptr%jmat(mol%nat, mol%nat))
+   end if
+   if (.not.allocated(ptr%vat)) then
+      allocate(ptr%vat(mol%nat))
+   end if
+   if (.not.allocated(ptr%rad)) then
+      allocate(ptr%rad(mol%nat))
+   end if
+   if (.not.allocated(ptr%draddr)) then
+      allocate(ptr%draddr(3, mol%nat, mol%nat))
+   end if
+   if (.not.allocated(ptr%qscratch))then
+      allocate(ptr%qscratch(mol%nat))
+   end if
+   if (self%useCM5)then
+      if (.not.allocated(ptr%cm5))then
+         allocate(ptr%cm5(mol%nat))
+      end if
+      if (.not.allocated(ptr%dcm5dr))then
+         allocate(ptr%dcm5dr(3, mol%nat, mol%nat))
+      end if
+      call get_cm5_charges(mol, ptr%cm5, ptr%dcm5dr)
+   end if
+   if (self%useCM5.and..not.allocated(ptr%scratch))then
+      allocate(ptr%scratch(mol%nat))
+   end if
+
+   call self%gbobc%get_rad(mol, ptr%rad, ptr%draddr)
+   ptr%jmat(:, :) = 0.0_wp
+   select case(self%kernel)
+   case(born_kernel%p16)
+      call add_born_mat_p16(mol%nat, mol%xyz, self%keps, ptr%rad, ptr%jmat, self%partition)
+   case(born_kernel%still)
+      call add_born_mat_still(mol%nat, mol%xyz, self%keps, ptr%rad, ptr%jmat, self%partition)
+   case default
+      continue
+   end select
+
+   if (self%alpbet > 0.0_wp) then
+      call get_adet(mol%nat, mol%xyz, self%gbobc%vdwr, adet)
+      call add_born_shift(mol%nat, self%keps * self%alpbet / adet, ptr%jmat, self%partition)
+   end if
+end subroutine update
+
+
+!> Get solvation energy
+subroutine get_energy(self, mol, cache, wfn, energies)
+   !> Instance of the solvation model
+   class(alpb_solvation), intent(in) :: self
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+   !> Reusable data container
+   type(container_cache), intent(inout) :: cache
+   !> Wavefunction data
+   type(wavefunction_type), intent(in) :: wfn
+   !> Solvation free energy
+   real(wp), intent(inout) :: energies(:)
+
+   type(alpb_cache), pointer :: ptr
+
+   call view(cache, ptr)
+
+   if(self%useCM5)then
+      ptr%qscratch(:) = wfn%qat(:, 1) + ptr%cm5(:)
+   else
+      ptr%qscratch(:) = wfn%qat(:, 1)
+   end if
+
+   call symv(ptr%jmat, ptr%qscratch(:), ptr%vat, alpha=0.5_wp)
+   energies(:) = energies + ptr%vat * ptr%qscratch(:)
+end subroutine get_energy
+
+
+!> Get solvation potential
+subroutine get_potential(self, mol, cache, wfn, pot)
+   !> Instance of the solvation model
+   class(alpb_solvation), intent(in) :: self
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+   !> Reusable data container
+   type(container_cache), intent(inout) :: cache
+   !> Wavefunction data
+   type(wavefunction_type), intent(in) :: wfn
+   !> Density dependent potential
+   type(potential_type), intent(inout) :: pot
+
+   type(alpb_cache), pointer :: ptr
+
+   call view(cache, ptr)
+
+   if(self%useCM5)then
+      ptr%qscratch(:) = wfn%qat(:, 1) + ptr%cm5(:)
+   else
+      ptr%qscratch(:) = wfn%qat(:, 1)
+   end if
+
+   call symv(ptr%jmat, ptr%qscratch(:), pot%vat(:, 1), beta=1.0_wp)
+end subroutine get_potential
+
+
+!> Explicit geometry derivative of the atom-resolved ALPB/GBSA potential.
+!> Electronic charge response is intentionally excluded here; it is supplied
+!> by the coupled-perturbed GFN1 equations through wfn%dqatdr.
+subroutine get_potential_gradient(self, mol, cache, wfn, pot)
+   class(alpb_solvation), intent(in) :: self
+   type(structure_type), intent(in) :: mol
+   type(container_cache), intent(inout) :: cache
+   type(wavefunction_type), intent(in) :: wfn
+   type(potential_type), intent(inout) :: pot
+
+   type(alpb_cache), pointer :: ptr
+   integer :: iat, jat, ic, n3
+   real(wp) :: kval
+   real(wp), allocatable :: qeff(:), cgrad(:, :, :), kg(:), sgrad(:), dummyh(:, :)
+
+   call view(cache, ptr)
+   n3 = 3*mol%nat
+   allocate(qeff(mol%nat), cgrad(3,mol%nat,mol%nat), kg(n3))
+   cgrad = 0.0_wp
+   if (self%useCM5) then
+      qeff = wfn%qat(:,1) + ptr%cm5
+      cgrad = ptr%dcm5dr
+   else
+      qeff = wfn%qat(:,1)
+   end if
+
+   do iat = 1, mol%nat
+      if (owns_pair(self%partition, iat, iat)) then
+         call self_kernel_geometry(self%keps, ptr%rad(iat), ptr%draddr(:,:,iat), kval, kg)
+         call add_pair_potential_gradient(iat, iat, kval, kg, qeff, cgrad, pot%dvatdr(:,:,:,1))
+      end if
+      do jat = 1, iat-1
+         if (.not.owns_pair(self%partition, iat, jat)) cycle
+         call born_pair_geometry(self%kernel, self%keps, mol, iat, jat, ptr%rad, ptr%draddr, &
+            & kval, kg)
+         call add_pair_potential_gradient(iat, jat, kval, kg, qeff, cgrad, pot%dvatdr(:,:,:,1))
+      end do
+   end do
+
+   if (self%alpbet > 0.0_wp) then
+      allocate(sgrad(n3), dummyh(n3,n3))
+      call get_shift_geometry(mol, self%gbobc%vdwr, self%keps*self%alpbet, kval, sgrad, dummyh)
+      do iat = 1, mol%nat
+         do jat = 1, iat
+            if (.not.owns_pair(self%partition, iat, jat)) cycle
+            call add_pair_potential_gradient(iat, jat, kval, sgrad, qeff, cgrad, pot%dvatdr(:,:,:,1))
+         end do
+      end do
+   end if
+
+   ! Once CP-GFN1 has produced q', include the density-response part J q'.
+   ! During construction of the CP right-hand side dqatdr is zero, so this
+   ! same routine naturally reduces to the required explicit derivative.
+   if (allocated(wfn%dqatdr)) then
+      do iat = 1, mol%nat
+         do ic = 1, 3
+            pot%dvatdr(ic,iat,:,1) = pot%dvatdr(ic,iat,:,1) &
+               + matmul(ptr%jmat, wfn%dqatdr(ic,iat,:,1))
+         end do
+      end do
+   end if
+end subroutine get_potential_gradient
+
+
+!> Analytic ALPB/GBSA Hessian including the response of the electronic atomic
+!> charges supplied by CP-GFN1.  CM5 is differentiated through second order.
+subroutine get_interaction_hessian(self, mol, cache, wfn, hessian)
+   class(alpb_solvation), intent(in) :: self
+   type(structure_type), intent(in) :: mol
+   type(container_cache), intent(inout) :: cache
+   type(wavefunction_type), intent(in) :: wfn
+   real(wp), intent(inout) :: hessian(:, :)
+
+   type(alpb_cache), pointer :: ptr
+   integer :: iat, jat, ic, jc, col, n3
+   real(wp) :: kval
+   real(wp), allocatable :: rad(:), drad(:, :, :), d2rad(:, :, :, :, :)
+   real(wp), allocatable :: qeff(:), cgrad(:, :, :), chess(:, :, :, :, :)
+   real(wp), allocatable :: kg(:), kh(:, :), vgrad(:, :, :), qresp(:)
+
+   call view(cache, ptr)
+   n3 = 3*mol%nat
+   allocate(rad(mol%nat), drad(3,mol%nat,mol%nat), &
+      d2rad(3,mol%nat,3,mol%nat,mol%nat))
+   call self%gbobc%get_rad(mol, rad, drad, d2rad)
+
+   allocate(qeff(mol%nat), cgrad(3,mol%nat,mol%nat), &
+      chess(3,mol%nat,3,mol%nat,mol%nat))
+   cgrad = 0.0_wp; chess = 0.0_wp
+   if (self%useCM5) then
+      call get_cm5_charges(mol, qeff, cgrad, chess)
+      qeff = qeff + wfn%qat(:,1)
+   else
+      qeff = wfn%qat(:,1)
+   end if
+
+   allocate(kg(n3), kh(n3,n3), vgrad(3,mol%nat,mol%nat), qresp(mol%nat))
+   vgrad = 0.0_wp
+
+   do iat = 1, mol%nat
+      if (owns_pair(self%partition, iat, iat)) then
+         call self_kernel_geometry(self%keps, rad(iat), drad(:,:,iat), kval, kg, &
+            & reshape(d2rad(:,:,:,:,iat),[n3,n3]), kh)
+         call add_pair_explicit_hessian(iat, iat, kval, kg, kh, qeff, cgrad, chess, hessian)
+         call add_pair_potential_gradient(iat, iat, kval, kg, qeff, cgrad, vgrad)
+      end if
+      do jat = 1, iat-1
+         if (.not.owns_pair(self%partition, iat, jat)) cycle
+         call born_pair_geometry(self%kernel, self%keps, mol, iat, jat, rad, drad, &
+            & kval, kg, d2rad, kh)
+         call add_pair_explicit_hessian(iat, jat, kval, kg, kh, qeff, cgrad, chess, hessian)
+         call add_pair_potential_gradient(iat, jat, kval, kg, qeff, cgrad, vgrad)
+      end do
+   end do
+
+   if (self%alpbet > 0.0_wp) then
+      call get_shift_geometry(mol, self%gbobc%vdwr, self%keps*self%alpbet, kval, kg, kh)
+      do iat = 1, mol%nat
+         do jat = 1, iat
+            if (.not.owns_pair(self%partition, iat, jat)) cycle
+            call add_pair_explicit_hessian(iat, jat, kval, kg, kh, qeff, cgrad, chess, hessian)
+            call add_pair_potential_gradient(iat, jat, kval, kg, qeff, cgrad, vgrad)
+         end do
+      end do
+   end if
+
+   ! Electronic charge response: d/dR_y (dE/dR_x) = q'_y . V'_x.
+   if (allocated(wfn%dqatdr)) then
+      do jat = 1, mol%nat
+         do jc = 1, 3
+            col = 3*(jat-1)+jc
+            qresp = wfn%dqatdr(jc,jat,:,1)
+            do iat = 1, mol%nat
+               do ic = 1, 3
+                  hessian(3*(iat-1)+ic,col) = hessian(3*(iat-1)+ic,col) &
+                     + dot_product(vgrad(ic,iat,:), qresp)
+               end do
+            end do
+         end do
+      end do
+   end if
+end subroutine get_interaction_hessian
+
+
+!> Get solvation gradient
+subroutine get_gradient(self, mol, cache, wfn, gradient, sigma)
+   !> Instance of the solvation model
+   class(alpb_solvation), intent(in) :: self
+   !> Molecular structure data
+   type(structure_type), intent(in) :: mol
+   !> Reusable data container
+   type(container_cache), intent(inout) :: cache
+   !> Wavefunction data
+   type(wavefunction_type), intent(in) :: wfn
+   !> Molecular gradient of the solvation free energy
+   real(wp), contiguous, intent(inout) :: gradient(:, :)
+   !> Strain derivatives of the solvation free energy
+   real(wp), contiguous, intent(inout) :: sigma(:, :)
+
+   type(alpb_cache), pointer :: ptr
+   real(wp) :: energy
+
+   energy = 0.0_wp
+   call view(cache, ptr)
+
+   if(self%useCM5)then
+      ptr%qscratch(:) = wfn%qat(:, 1) + ptr%cm5(:)
+   else
+      ptr%qscratch(:) = wfn%qat(:, 1)
+   end if
+
+   select case(self%kernel)
+   case(born_kernel%p16)
+      call add_born_deriv_p16(mol%nat, mol%xyz, &
+         & ptr%qscratch(:), self%keps, ptr%rad, ptr%draddr, energy, gradient, self%partition)
+   case(born_kernel%still)
+      call add_born_deriv_still(mol%nat, mol%xyz, &
+         & ptr%qscratch(:), self%keps, ptr%rad, ptr%draddr, energy, gradient, self%partition)
+   case default
+      continue
+   end select
+
+   ! the determinant of the inertia tensor couples all atoms
+   if (self%alpbet > 0.0_wp .and. owns_index(self%partition, 1)) then
+      call get_adet_deriv(mol%nat, mol%xyz, self%gbobc%vdwr, self%kEps*self%alpbet, &
+         & ptr%qscratch(:), gradient)
+   end if
+
+   if(self%useCM5)then
+      call gemv(ptr%jmat, ptr%qscratch, ptr%scratch)
+      call gemv(ptr%dcm5dr, ptr%scratch, gradient, beta=1.0_wp)
+   end if
+
+end subroutine get_gradient
+
+
+!> Return dependency on density
+pure function variable_info(self) result(info)
+   !> Instance of the solvation model
+   class(alpb_solvation), intent(in) :: self
+   !> Information on the required potential data
+   type(scf_info) :: info
+
+   info = scf_info(charge=atom_resolved)
+end function variable_info
+
+
+subroutine taint(cache, ptr)
+   type(container_cache), target, intent(inout) :: cache
+   type(alpb_cache), pointer, intent(out) :: ptr
+
+   if (allocated(cache%raw)) then
+      call view(cache, ptr)
+      if (associated(ptr)) return
+      deallocate(cache%raw)
+   end if
+
+   if (.not.allocated(cache%raw)) then
+      block
+         type(alpb_cache), allocatable :: tmp
+         allocate(tmp)
+         call move_alloc(tmp, cache%raw)
+      end block
+   end if
+
+   call view(cache, ptr)
+end subroutine taint
+
+subroutine view(cache, ptr)
+   type(container_cache), target, intent(inout) :: cache
+   type(alpb_cache), pointer, intent(out) :: ptr
+   nullify(ptr)
+   select type(target => cache%raw)
+   type is(alpb_cache)
+      ptr => target
+   end select
+end subroutine view
+
+!> Derivatives of an off-diagonal Born interaction kernel with respect to
+!> Cartesian geometry, including the geometry dependence of both Born radii.
+subroutine born_pair_geometry(kernel, keps, mol, iat, jat, rad, drad, kval, kg, d2rad, kh)
+   integer, intent(in) :: kernel, iat, jat
+   real(wp), intent(in) :: keps, rad(:), drad(:, :, :)
+   type(structure_type), intent(in) :: mol
+   real(wp), intent(out) :: kval, kg(:)
+   real(wp), intent(in), optional :: d2rad(:, :, :, :, :)
+   real(wp), intent(out), optional :: kh(:, :)
+
+   integer :: n3, ic, jc
+   real(wp) :: vec(3), r, u(3), hdist(3,3)
+   real(wp) :: kr, ki, kj, krr, kri, krj, kii, kij, kjj
+   real(wp), allocatable :: rg(:), gi(:), gj(:), rh(:, :), hi(:, :), hj(:, :)
+
+   n3=3*mol%nat
+   allocate(rg(n3),gi(n3),gj(n3),rh(n3,n3),hi(n3,n3),hj(n3,n3))
+   vec=mol%xyz(:,iat)-mol%xyz(:,jat); r=norm2(vec); u=vec/r
+   rg=0.0_wp; rh=0.0_wp
+   do ic=1,3
+      rg(3*(iat-1)+ic)= u(ic)
+      rg(3*(jat-1)+ic)=-u(ic)
+      do jc=1,3
+         hdist(ic,jc)=(merge(1.0_wp,0.0_wp,ic==jc)-u(ic)*u(jc))/r
+      end do
+   end do
+   rh(3*iat-2:3*iat,3*iat-2:3*iat)= hdist
+   rh(3*jat-2:3*jat,3*jat-2:3*jat)= hdist
+   rh(3*iat-2:3*iat,3*jat-2:3*jat)=-hdist
+   rh(3*jat-2:3*jat,3*iat-2:3*iat)=-hdist
+   gi=reshape(drad(:,:,iat),[n3]); gj=reshape(drad(:,:,jat),[n3])
+
+   call born_kernel_partials(kernel,keps,r,rad(iat),rad(jat),kval,kr,ki,kj, &
+      krr,kri,krj,kii,kij,kjj)
+   kg=kr*rg+ki*gi+kj*gj
+
+   if (present(kh)) then
+      if (.not.present(d2rad)) error stop "Born Hessian requested without Born-radius Hessian"
+      hi=reshape(d2rad(:,:,:,:,iat),[n3,n3])
+      hj=reshape(d2rad(:,:,:,:,jat),[n3,n3])
+      kh=kr*rh+ki*hi+kj*hj
+      kh=kh+krr*outer(rg,rg)+kri*(outer(rg,gi)+outer(gi,rg)) &
+         +krj*(outer(rg,gj)+outer(gj,rg))+kii*outer(gi,gi) &
+         +kij*(outer(gi,gj)+outer(gj,gi))+kjj*outer(gj,gj)
+   end if
+end subroutine born_pair_geometry
+
+subroutine self_kernel_geometry(keps, brad, bgrad, kval, kg, bhess, kh)
+   real(wp), intent(in) :: keps, brad, bgrad(:, :)
+   real(wp), intent(out) :: kval, kg(:)
+   real(wp), intent(in), optional :: bhess(:, :)
+   real(wp), intent(out), optional :: kh(:, :)
+   real(wp), allocatable :: g(:)
+   real(wp) :: k1,k2
+   g=reshape(bgrad,[size(kg)])
+   kval=keps/brad; k1=-keps/(brad*brad); k2=2.0_wp*keps/(brad**3)
+   kg=k1*g
+   if (present(kh)) then
+      if (.not.present(bhess)) error stop "Self Born Hessian requested without radius Hessian"
+      kh=k1*bhess+k2*outer(g,g)
+   end if
+end subroutine self_kernel_geometry
+
+pure subroutine born_kernel_partials(kernel,keps,r,bi,bj,k,kr,ki,kj,krr,kri,krj,kii,kij,kjj)
+   integer, intent(in) :: kernel
+   real(wp), intent(in) :: keps,r,bi,bj
+   real(wp), intent(out) :: k,kr,ki,kj,krr,kri,krj,kii,kij,kjj
+   type(hyperdual) :: hr,hi,hj,out
+
+   hr=hd(r,1.0_wp,1.0_wp); hi=hd(bi); hj=hd(bj)
+   out=eval_born_kernel(kernel,keps,hr,hi,hj); k=out%v; kr=out%dx; krr=out%dxy
+   hr=hd(r,1.0_wp,0.0_wp); hi=hd(bi,0.0_wp,1.0_wp); hj=hd(bj)
+   out=eval_born_kernel(kernel,keps,hr,hi,hj); kri=out%dxy
+   hr=hd(r,1.0_wp,0.0_wp); hi=hd(bi); hj=hd(bj,0.0_wp,1.0_wp)
+   out=eval_born_kernel(kernel,keps,hr,hi,hj); krj=out%dxy
+   hr=hd(r); hi=hd(bi,1.0_wp,1.0_wp); hj=hd(bj)
+   out=eval_born_kernel(kernel,keps,hr,hi,hj); ki=out%dx; kii=out%dxy
+   hr=hd(r); hi=hd(bi,1.0_wp,0.0_wp); hj=hd(bj,0.0_wp,1.0_wp)
+   out=eval_born_kernel(kernel,keps,hr,hi,hj); kij=out%dxy
+   hr=hd(r); hi=hd(bi); hj=hd(bj,1.0_wp,1.0_wp)
+   out=eval_born_kernel(kernel,keps,hr,hi,hj); kj=out%dx; kjj=out%dxy
+end subroutine born_kernel_partials
+
+pure function eval_born_kernel(kernel,keps,r,bi,bj) result(out)
+   integer, intent(in) :: kernel
+   real(wp), intent(in) :: keps
+   type(hyperdual), intent(in) :: r,bi,bj
+   type(hyperdual) :: out,ab,arg1,arg16,aa,dd,ex,fgb
+   select case(kernel)
+   case(born_kernel%p16)
+      ab=hd_sqrt(bi*bj)
+      arg1=ab/(ab+zetaP16o16*r)
+      arg16=arg1*arg1; arg16=arg16*arg16; arg16=arg16*arg16; arg16=arg16*arg16
+      out=keps/(r+ab*arg16)
+   case(born_kernel%still)
+      aa=bi*bj; dd=0.25_wp*r*r/aa; ex=hd_exp(-dd)
+      fgb=hd_sqrt(r*r+aa*ex)
+      out=keps/fgb
+   case default
+      out=hd(0.0_wp)
+   end select
+end function eval_born_kernel
+
+pure function outer(a,b) result(c)
+   real(wp), intent(in) :: a(:),b(:)
+   real(wp) :: c(size(a),size(b))
+   c=spread(a,2,size(b))*spread(b,1,size(a))
+end function outer
+
+subroutine add_pair_potential_gradient(iat,jat,k,kg,q,cgrad,vgrad)
+   integer, intent(in) :: iat,jat
+   real(wp), intent(in) :: k,kg(:),q(:),cgrad(:, :, :)
+   real(wp), intent(inout) :: vgrad(:, :, :)
+   real(wp), allocatable :: gm(:, :)
+   gm=reshape(kg,[3,size(q)])
+   if (iat==jat) then
+      vgrad(:,:,iat)=vgrad(:,:,iat)+gm*q(iat)+k*cgrad(:,:,iat)
+   else
+      vgrad(:,:,iat)=vgrad(:,:,iat)+gm*q(jat)+k*cgrad(:,:,jat)
+      vgrad(:,:,jat)=vgrad(:,:,jat)+gm*q(iat)+k*cgrad(:,:,iat)
+   end if
+end subroutine add_pair_potential_gradient
+
+subroutine add_pair_explicit_hessian(iat,jat,k,kg,kh,q,cgrad,chess,hessian)
+   integer, intent(in) :: iat,jat
+   real(wp), intent(in) :: k,kg(:),kh(:, :),q(:),cgrad(:, :, :),chess(:, :, :, :, :)
+   real(wp), intent(inout) :: hessian(:, :)
+   integer :: n3
+   real(wp), allocatable :: ci(:),cj(:),hi(:, :),hj(:, :)
+   n3=size(kg)
+   ci=reshape(cgrad(:,:,iat),[n3]); hi=reshape(chess(:,:,:,:,iat),[n3,n3])
+   if (iat==jat) then
+      hessian=hessian+0.5_wp*q(iat)*q(iat)*kh+q(iat)*k*hi+k*outer(ci,ci) &
+         +q(iat)*(outer(ci,kg)+outer(kg,ci))
+   else
+      cj=reshape(cgrad(:,:,jat),[n3]); hj=reshape(chess(:,:,:,:,jat),[n3,n3])
+      hessian=hessian+q(iat)*q(jat)*kh+q(jat)*k*hi+q(iat)*k*hj &
+         +k*(outer(ci,cj)+outer(cj,ci)) &
+         +q(jat)*(outer(ci,kg)+outer(kg,ci)) &
+         +q(iat)*(outer(cj,kg)+outer(kg,cj))
+   end if
+end subroutine add_pair_explicit_hessian
+
+subroutine get_shift_geometry(mol, rad, factor, shift, grad, hess)
+   type(structure_type), intent(in) :: mol
+   real(wp), intent(in) :: rad(:), factor
+   real(wp), intent(out) :: shift,grad(:),hess(:, :)
+   real(wp) :: adet
+   real(wp), allocatable :: da(:),d2a(:, :)
+   allocate(da(3*mol%nat),d2a(3*mol%nat,3*mol%nat))
+   call get_adet_all(mol%nat,mol%xyz,rad,adet,da,d2a)
+   shift=factor/adet
+   grad=-factor*da/(adet*adet)
+   hess=2.0_wp*factor*outer(da,da)/(adet**3)-factor*d2a/(adet*adet)
+end subroutine get_shift_geometry
+
+subroutine get_adet_all(nat,xyz,rad,adet,dadet,d2adet)
+   integer, intent(in) :: nat
+   real(wp), intent(in) :: xyz(:, :),rad(:)
+   real(wp), intent(out) :: adet,dadet(:),d2adet(:, :)
+   integer :: i,j,a,b,x,y
+   real(wp) :: vol,w(nat),center(3),rvec(3,nat),inertia(3,3),inv(3,3),deti
+   real(wp) :: ix(3,3),iy(3,3),ixy(3,3),tx,ty,txy,fac
+   real(wp), parameter :: tof=2.0_wp/5.0_wp,pow=1.0_wp/6.0_wp
+   real(wp), parameter :: eye(3,3)=reshape([1.0_wp,0.0_wp,0.0_wp,0.0_wp,1.0_wp,0.0_wp,0.0_wp,0.0_wp,1.0_wp],[3,3])
+   w=rad**3; vol=sum(w); center=0.0_wp
+   do i=1,nat; center=center+w(i)*xyz(:,i); end do
+   center=center/vol
+   do i=1,nat; rvec(:,i)=xyz(:,i)-center; end do
+   inertia=0.0_wp
+   do i=1,nat
+      inertia=inertia+w(i)*((dot_product(rvec(:,i),rvec(:,i))+tof*rad(i)**2)*eye &
+         -spread(rvec(:,i),1,3)*spread(rvec(:,i),2,3))
+   end do
+   deti=matdet_3x3(inertia); inv=matinv_3x3(inertia)
+   adet=sqrt(deti**(1.0_wp/3.0_wp)/(tof*vol))
+   dadet=0.0_wp; d2adet=0.0_wp
+   do i=1,nat
+      do a=1,3
+         x=3*(i-1)+a
+         call inertia_first(i,a,w,rvec,ix)
+         tx=trace3(matmul(inv,ix))
+         dadet(x)=adet*pow*tx
+         do j=1,nat
+            do b=1,3
+               y=3*(j-1)+b
+               call inertia_first(j,b,w,rvec,iy)
+               fac=merge(1.0_wp,0.0_wp,i==j)-w(j)/vol
+               ixy=w(i)*fac*(2.0_wp*merge(1.0_wp,0.0_wp,a==b)*eye &
+                  -unit_outer(a,b)-unit_outer(b,a))
+               ty=trace3(matmul(inv,iy))
+               txy=trace3(matmul(inv,ixy)-matmul(matmul(matmul(inv,iy),inv),ix))
+               d2adet(x,y)=adet*(pow*pow*tx*ty+pow*txy)
+            end do
+         end do
+      end do
+   end do
+end subroutine get_adet_all
+
+pure subroutine inertia_first(i,a,w,rvec,deriv)
+   integer,intent(in)::i,a
+   real(wp),intent(in)::w(:),rvec(:, :)
+   real(wp),intent(out)::deriv(3,3)
+   real(wp),parameter::eye(3,3)=reshape([1.0_wp,0.0_wp,0.0_wp,0.0_wp,1.0_wp,0.0_wp,0.0_wp,0.0_wp,1.0_wp],[3,3])
+   real(wp)::e(3)
+   e=0.0_wp;e(a)=1.0_wp
+   deriv=w(i)*(2.0_wp*rvec(a,i)*eye-spread(e,2,3)*spread(rvec(:,i),1,3) &
+      -spread(rvec(:,i),2,3)*spread(e,1,3))
+end subroutine inertia_first
+
+pure function unit_outer(a,b) result(m)
+   integer,intent(in)::a,b
+   real(wp)::m(3,3)
+   m=0.0_wp;m(a,b)=1.0_wp
+end function unit_outer
+
+pure real(wp) function trace3(a)
+   real(wp),intent(in)::a(3,3)
+   trace3=a(1,1)+a(2,2)+a(3,3)
+end function trace3
+
+
+subroutine add_born_mat_p16(nat, xyz, keps, brad, Amat, partition)
+   !> Number of atoms
+   integer, intent(in) :: nat
+   !> Cartesian coordinates
+   real(wp), intent(in) :: xyz(:, :)
+   !> Dielectric screening
+   real(wp), intent(in) :: keps
+   !> Born radii
+   real(wp), intent(in) :: brad(:)
+   !> Interaction matrix
+   real(wp), intent(inout) :: Amat(:, :)
+   !> Share of the atom pairs evaluated here, absent selects the complete work
+   type(work_partition), intent(in), optional :: partition
+
+   integer :: iat, jat
+   real(wp) :: r1, ab, arg, fgb, dfgb, bp, vec(3)
+
+   ! omp parallel do default(none) shared(Amat, ntpair, ppind, ddpair, brad, keps) &
+   ! omp private(kk, iat, jat, r1, ab, arg, fgb, dfgb)
+   do iat = 1, nat
+      do jat = 1, iat - 1
+         if (.not.owns_pair(partition, iat, jat)) cycle
+         vec(:) = xyz(:, iat) - xyz(:, jat)
+         r1 = norm2(vec)
+
+         ab = sqrt(brad(iat) * brad(jat))
+         arg = ab / (ab + zetaP16o16*r1) ! ab / (1 + ζR/(16·ab))
+         arg = arg * arg ! ab / (1 + ζR/(16·ab))²
+         arg = arg * arg ! ab / (1 + ζR/(16·ab))⁴
+         arg = arg * arg ! ab / (1 + ζR/(16·ab))⁸
+         arg = arg * arg ! ab / (1 + ζR/(16·ab))¹⁶
+         fgb = r1 + ab*arg
+         dfgb = 1.0_wp / fgb
+
+         Amat(iat, jat) = keps*dfgb + Amat(iat, jat)
+         Amat(jat, iat) = keps*dfgb + Amat(jat, iat)
+      end do
+      ! self-energy part
+      if (.not.owns_pair(partition, iat, iat)) cycle
+      bp = 1.0_wp/brad(iat)
+      Amat(iat, iat) = Amat(iat, iat) + keps*bp
+   end do
+
+end subroutine add_born_mat_p16
+
+
+!> Constant shift of the interaction matrix from the analytical linearized
+!> Poisson-Boltzmann correction
+subroutine add_born_shift(nat, shift, Amat, partition)
+   !> Number of atoms
+   integer, intent(in) :: nat
+   !> Shift applied to every pair of the interaction matrix
+   real(wp), intent(in) :: shift
+   !> Interaction matrix
+   real(wp), intent(inout) :: Amat(:, :)
+   !> Share of the atom pairs evaluated here, absent selects the complete work
+   type(work_partition), intent(in), optional :: partition
+
+   integer :: iat, jat
+
+   do iat = 1, nat
+      do jat = 1, iat
+         if (.not.owns_pair(partition, iat, jat)) cycle
+         Amat(iat, jat) = Amat(iat, jat) + shift
+         if (iat /= jat) Amat(jat, iat) = Amat(jat, iat) + shift
+      end do
+   end do
+
+end subroutine add_born_shift
+
+
+subroutine add_born_deriv_p16(nat, xyz, qat, keps, &
+      & brad, brdr, energy, gradient, partition)
+   !> Number of atoms
+   integer, intent(in) :: nat
+   !> Cartesian coordinates
+   real(wp), intent(in) :: xyz(:, :)
+   !> Atomic partial charges
+   real(wp), intent(in) :: qat(:)
+   !> Dielectric screening
+   real(wp), intent(in) :: keps
+   !> Born radii
+   real(wp), intent(in) :: brad(:)
+   !> Derivative of Born radii w.r.t. cartesian coordinates
+   real(wp), contiguous, intent(in) :: brdr(:, :, :)
+   !> Total Born solvation energy
+   real(wp), intent(out) :: energy
+   !> Deriatives of Born solvation energy
+   real(wp), contiguous, intent(inout) :: gradient(:, :)
+   !> Share of the atom pairs evaluated here, absent selects the complete work
+   type(work_partition), intent(in), optional :: partition
+
+   integer :: iat, jat
+   real(wp) :: vec(3), r2, r1, ab, arg1, arg16, qq, fgb, dfgb, dfgb2, egb
+   real(wp) :: dEdbri, dEdbrj, dG(3), ap, bp, dS(3, 3)
+   real(wp), allocatable :: dEdbr(:)
+
+   allocate(dEdbr(nat), source = 0.0_wp )
+
+   egb = 0.0_wp
+   dEdbr(:) = 0.0_wp
+
+   ! GB energy and gradient
+   ! omp parallel do default(none) reduction(+:egb, gradient, dEdbr) &
+   ! omp private(iat, jat, vec, r1, r2, ab, arg1, arg16, fgb, dfgb, dfgb2, ap, &
+   ! omp& bp, qq, dEdbri, dEdbrj, dG, dS) &
+   ! omp shared(keps, qat, ntpair, ddpair, ppind, brad)
+   do iat = 1, nat
+      do jat = 1, iat - 1
+         if (.not.owns_pair(partition, iat, jat)) cycle
+         vec(:) = xyz(:, iat) - xyz(:, jat)
+         r1 = norm2(vec)
+         r2 = r1*r1
+
+         qq = qat(iat)*qat(jat)
+
+         ab = sqrt(brad(iat) * brad(jat))
+         arg1 = ab / (ab + zetaP16o16*r1) ! 1 / (1 + ζR/(16·ab))
+         arg16 = arg1 * arg1 ! 1 / (1 + ζR/(16·ab))²
+         arg16 = arg16 * arg16 ! 1 / (1 + ζR/(16·ab))⁴
+         arg16 = arg16 * arg16 ! 1 / (1 + ζR/(16·ab))⁸
+         arg16 = arg16 * arg16 ! 1 / (1 + ζR/(16·ab))¹⁶
+
+         fgb = r1 + ab*arg16
+         dfgb = 1.0_wp / fgb
+         dfgb2 = dfgb * dfgb
+
+         egb = egb + qq*keps*dfgb
+
+         ! (1 - ζ/(1 + Rζ/(16 ab))^17)/(R + ab/(1 + Rζ/(16 ab))¹⁶)²
+         ap = (1.0_wp - zetaP16 * arg1 * arg16) * dfgb2
+         dG(:) = ap * vec * keps / r1 * qq
+         gradient(:, iat) = gradient(:, iat) - dG
+         gradient(:, jat) = gradient(:, jat) + dG
+
+         ! -(Rζ/(2·ab²·(1 + Rζ/(16·ab))¹⁷) + 1/(2·ab·(1 + Rζ/(16·ab))¹⁶))/(R + ab/(1 + Rζ/(16·ab))¹⁶)²
+         bp = -0.5_wp*(r1 * zetaP16 / ab * arg1 + 1.0_wp) / ab * arg16 * dfgb2
+         dEdbri = brad(jat) * bp * keps * qq
+         dEdbrj = brad(iat) * bp * keps * qq
+         dEdbr(iat) = dEdbr(iat) + dEdbri
+         dEdbr(jat) = dEdbr(jat) + dEdbrj
+
+      end do
+
+      ! self-energy part
+      if (.not.owns_pair(partition, iat, iat)) cycle
+      bp = 1.0_wp/brad(iat)
+      qq = qat(iat)*bp
+      egb = egb + 0.5_wp*qat(iat)*qq*keps
+      dEdbri = -0.5_wp*keps*qq*bp
+      dEdbr(iat) = dEdbr(iat) + dEdbri*qat(iat)
+      !gradient = gradient + brdr(:, :, i) * dEdbri*qat(i)
+   end do
+
+   ! contract with the Born radii derivatives
+   call gemv(brdr, dEdbr, gradient, beta=1.0_wp)
+
+   energy = egb
+
+end subroutine add_born_deriv_p16
+
+
+pure subroutine add_born_mat_still(nat, xyz, keps, brad, Amat, partition)
+   !> Number of atoms
+   integer, intent(in) :: nat
+   !> Cartesian coordinates
+   real(wp), intent(in) :: xyz(:, :)
+   !> Dielectric screening
+   real(wp), intent(in) :: keps
+   !> Born radii
+   real(wp), intent(in) :: brad(:)
+   !> Interaction matrix
+   real(wp), intent(inout) :: Amat(:, :)
+   !> Share of the atom pairs evaluated here, absent selects the complete work
+   type(work_partition), intent(in), optional :: partition
+
+   integer  :: i, j
+   real(wp), parameter :: a13=1.0_wp/3.0_wp
+   real(wp), parameter :: a4=0.25_wp
+   real(wp), parameter :: sqrt2pi = sqrt(2.0_wp/pi)
+   real(wp) :: aa, vec(3), r1, r2, bp
+   real(wp) :: dd, expd, fgb2, dfgb
+
+   do i = 1, nat
+      do j = 1, i - 1
+         if (.not.owns_pair(partition, i, j)) cycle
+         vec(:) = xyz(:, i) - xyz(:, j)
+         r1 = norm2(vec)
+         r2 = r1*r1
+
+         aa = brad(i)*brad(j)
+         dd = a4*r2/aa
+         expd = exp(-dd)
+         fgb2 = r2+aa*expd
+         dfgb = 1.0_wp/sqrt(fgb2)
+         Amat(i, j) = keps*dfgb + Amat(i, j)
+         Amat(j, i) = keps*dfgb + Amat(j, i)
+      end do
+
+      ! self-energy part
+      if (.not.owns_pair(partition, i, i)) cycle
+      bp = 1.0_wp/brad(i)
+      Amat(i, i) = Amat(i, i) + keps*bp
+   end do
+
+end subroutine add_born_mat_still
+
+
+subroutine add_born_deriv_still(nat, xyz, qat, keps, &
+      & brad, brdr, energy, gradient, partition)
+   !> Number of atoms
+   integer, intent(in) :: nat
+   !> Cartesian coordinates
+   real(wp), intent(in) :: xyz(:, :)
+   !> Atomic partial charges
+   real(wp), intent(in) :: qat(:)
+   !> Dielectric screening
+   real(wp), intent(in) :: keps
+   !> Born radii
+   real(wp), intent(in) :: brad(:)
+   !> Derivative of Born radii w.r.t. cartesian coordinates
+   real(wp), contiguous, intent(in) :: brdr(:, :, :)
+   !> Total Born solvation energy
+   real(wp), intent(out) :: energy
+   !> Deriatives of Born solvation energy
+   real(wp), contiguous, intent(inout) :: gradient(:, :)
+   !> Share of the atom pairs evaluated here, absent selects the complete work
+   type(work_partition), intent(in), optional :: partition
+
+   integer :: i, j
+   real(wp), parameter :: a13=1.0_wp/3.0_wp
+   real(wp), parameter :: a4=0.25_wp
+   real(wp) :: aa, r2, fgb2
+   real(wp) :: qq, dd, expd, dfgb, dfgb2, dfgb3, egb, ap, bp
+   real(wp) :: grddbi, grddbj
+   real(wp) :: dr(3), r1, vec(3)
+   real(wp), allocatable :: grddb(:)
+
+   allocate(grddb(nat), source = 0.0_wp )
+
+   egb = 0.0_wp
+   grddb(:) = 0.0_wp
+
+   ! GB energy and gradient
+
+   ! compute energy and fgb direct and radii derivatives
+   do i = 1, nat
+      do j = 1, i - 1
+         if (.not.owns_pair(partition, i, j)) cycle
+         vec(:) = xyz(:, i) - xyz(:, j)
+         r1 = norm2(vec)
+         r2 = r1*r1
+
+         ! dielectric scaling of the charges
+         qq = qat(i)*qat(j)
+         aa = brad(i)*brad(j)
+         dd = a4*r2/aa
+         expd = exp(-dd)
+         fgb2 = r2+aa*expd
+         dfgb2 = 1.0_wp/fgb2
+         dfgb = sqrt(dfgb2)
+         dfgb3 = dfgb2*dfgb*keps
+
+         egb = egb + qq*keps*dfgb
+
+         ap = (1.0_wp-a4*expd)*dfgb3
+         dr = ap*vec
+         gradient(:, i) = gradient(:, i) - dr*qq
+         gradient(:, j) = gradient(:, j) + dr*qq
+
+         bp = -0.5_wp*expd*(1.0_wp+dd)*dfgb3
+         grddbi = brad(j)*bp
+         grddbj = brad(i)*bp
+         grddb(i) = grddb(i) + grddbi*qq
+         grddb(j) = grddb(j) + grddbj*qq
+
+      end do
+
+      ! self-energy part
+      if (.not.owns_pair(partition, i, i)) cycle
+      bp = 1.0_wp/brad(i)
+      qq = qat(i)*bp
+      egb = egb + 0.5_wp*qat(i)*qq*keps
+      grddbi = -0.5_wp*keps*qq*bp
+      grddb(i) = grddb(i) + grddbi*qat(i)
+   end do
+
+   ! contract with the Born radii derivatives
+   call gemv(brdr, grddb, gradient, beta=1.0_wp)
+
+   energy = egb
+
+end subroutine add_born_deriv_still
+
+
+subroutine get_adet(nat, xyz, rad, aDet)
+   !> Number of atoms
+   integer, intent(in) :: nat
+   !> Cartesian coordinates
+   real(wp), intent(in) :: xyz(:, :)
+   !> Atomic radii
+   real(wp), intent(in) :: rad(:)
+   !> Shape descriptor of the structure
+   real(wp), intent(out) :: aDet
+
+   integer :: iat
+   real(wp) :: r2, rad2, rad3, vol, vec(3), center(3), inertia(3, 3)
+   real(wp), parameter :: tof = 2.0_wp/5.0_wp, unity(3, 3) = reshape(&
+      & [1.0_wp, 0.0_wp, 0.0_wp, 0.0_wp, 1.0_wp, 0.0_wp, 0.0_wp, 0.0_wp, 1.0_wp], &
+      & [3, 3])
+
+   vol = 0.0_wp
+   center(:) = 0.0_wp
+   do iat = 1, nat
+      rad2 = rad(iat) * rad(iat)
+      rad3 = rad2 * rad(iat)
+      vol = vol + rad3
+      center(:) = center + xyz(:, iat) * rad3
+   end do
+   center = center / vol
+
+   inertia(:, :) = 0.0_wp
+   do iat = 1, nat
+      rad2 = rad(iat) * rad(iat)
+      rad3 = rad2 * rad(iat)
+      vec(:) = xyz(:, iat) - center
+      r2 = sum(vec**2)
+      inertia(:, :) = inertia + rad3 * ((r2 + tof*rad2) * unity &
+         & - spread(vec, 1, 3) * spread(vec, 2, 3))
+   end do
+
+   aDet = sqrt(matdet_3x3(inertia)**(1.0_wp/3.0_wp)/(tof*vol))
+
+end subroutine get_adet
+
+
+subroutine get_adet_deriv(nAtom, xyz, rad, kEps, qvec, gradient)
+   !> Number of atoms
+   integer, intent(in) :: nAtom
+   !> Cartesian coordinates
+   real(wp), intent(in) :: xyz(:, :)
+   !> Atomic radii
+   real(wp), intent(in) :: rad(:)
+   real(wp), intent(in) :: kEps
+   real(wp), intent(in) :: qvec(:)
+   !> Molecular gradient
+   real(wp), intent(inout) :: gradient(:, :)
+
+   integer :: iat
+   real(wp) :: r2, rad2, rad3, vol, vec(3), center(3), inertia(3, 3), aDet
+   real(wp) :: aDeriv(3, 3), qtotal
+   real(wp), parameter :: tof = 2.0_wp/5.0_wp, unity(3, 3) = reshape(&
+      & [1.0_wp, 0.0_wp, 0.0_wp, 0.0_wp, 1.0_wp, 0.0_wp, 0.0_wp, 0.0_wp, 1.0_wp], &
+      & [3, 3])
+
+   qtotal = 0.0_wp
+   vol = 0.0_wp
+   center(:) = 0.0_wp
+   do iat = 1, nAtom
+      rad2 = rad(iat) * rad(iat)
+      rad3 = rad2 * rad(iat)
+      vol = vol + rad3
+      center(:) = center + xyz(:, iat) * rad3
+      qtotal = qtotal + qvec(iat)
+   end do
+   center = center / vol
+
+   inertia(:, :) = 0.0_wp
+   do iat = 1, nAtom
+      rad2 = rad(iat) * rad(iat)
+      rad3 = rad2 * rad(iat)
+      vec(:) = xyz(:, iat) - center
+      r2 = sum(vec**2)
+      inertia(:, :) = inertia + rad3 * ((r2 + tof*rad2) * unity &
+         & - spread(vec, 1, 3) * spread(vec, 2, 3))
+   end do
+   aDet = sqrt(matdet_3x3(inertia)**(1.0_wp/3.0_wp)/(tof*vol))
+
+   aDeriv(:, :) = reshape([&
+      & inertia(1,1)*(inertia(2,2)+inertia(3,3))-inertia(1,2)**2-inertia(1,3)**2, &
+      & inertia(1,2)*inertia(3,3)-inertia(1,3)*inertia(2,3), & ! xy
+      & inertia(1,3)*inertia(2,2)-inertia(1,2)*inertia(3,2), & ! xz
+      & inertia(1,2)*inertia(3,3)-inertia(1,3)*inertia(2,3), & ! xy
+      & inertia(2,2)*(inertia(1,1)+inertia(3,3))-inertia(1,2)**2-inertia(2,3)**2, &
+      & inertia(1,1)*inertia(2,3)-inertia(1,2)*inertia(1,3), & ! yz
+      & inertia(1,3)*inertia(2,2)-inertia(1,2)*inertia(3,2), & ! xz
+      & inertia(1,1)*inertia(2,3)-inertia(1,2)*inertia(1,3), & ! yz
+      & inertia(3,3)*(inertia(1,1)+inertia(2,2))-inertia(1,3)**2-inertia(2,3)**2],&
+      & shape=[3, 3]) * (250.0_wp / (48.0_wp * vol**3 * aDet**5)) &
+      & * (-0.5_wp * kEps * qtotal**2 / aDet**2)
+
+   do iat = 1, nAtom
+      rad2 = rad(iat) * rad(iat)
+      rad3 = rad2 * rad(iat)
+      vec(:) = xyz(:, iat) - center
+      gradient(:, iat) = gradient(:, iat) + rad3 * matmul(aderiv, vec)
+   end do
+
+end subroutine get_adet_deriv
+
+
+end module tblite_solvation_alpb

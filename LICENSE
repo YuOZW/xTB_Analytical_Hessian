@@ -1,0 +1,36 @@
+MIT License
+
+Copyright (c) 2026 Contributors to the GFN1-xTB analytic Hessian extensions
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of the original GFN1-xTB analytic Hessian extension code and associated
+documentation files introduced by this repository (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+Scope note
+----------
+
+This MIT License applies only to original contributions to the GFN1-xTB
+analytic Hessian extensions introduced by this repository, except where a
+source file states otherwise.
+
+This repository also includes and modifies source code from the upstream
+"tblite" project. Those upstream portions remain licensed under the GNU Lesser
+General Public License version 3 or later (LGPL-3.0-or-later). See COPYING and
+COPYING.LESSER. Distribution of the combined derivative work must comply with
+the applicable LGPL terms in addition to this MIT License for the original
+extension contributions.

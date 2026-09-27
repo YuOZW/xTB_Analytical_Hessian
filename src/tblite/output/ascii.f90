@@ -1,0 +1,383 @@
+! This file is part of tblite.
+! SPDX-Identifier: LGPL-3.0-or-later
+!
+! tblite is free software: you can redistribute it and/or modify it under
+! the terms of the GNU Lesser General Public License as published by
+! the Free Software Foundation, either version 3 of the License, or
+! (at your option) any later version.
+!
+! tblite is distributed in the hope that it will be useful,
+! but WITHOUT ANY WARRANTY; without even the implied warranty of
+! MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+! GNU Lesser General Public License for more details.
+!
+! You should have received a copy of the GNU Lesser General Public License
+! along with tblite.  If not, see <https://www.gnu.org/licenses/>.
+
+!> @dir tblite/output
+!> Contains routines for terminal or string output generation
+
+!> @file tblite/output/ascii.f90
+!> Provides routines for terminal or text file output
+
+!> Implementation of terminal or text file output
+module tblite_output_ascii
+   use mctc_env, only : wp
+   use mctc_io, only : structure_type
+   use mctc_io_convert, only : autoev
+   use tblite_version, only : get_tblite_version
+   implicit none
+   private
+
+   public :: ascii_levels, ascii_dipole_moments, ascii_quadrupole_moments
+   public :: ascii_vibrations
+   public :: json_results, tagged_result, ascii_atomic_charges
+
+contains
+
+
+subroutine ascii_levels(unit, verbosity, emo, focc, range)
+   integer, intent(in) :: unit
+   integer, intent(in) :: verbosity
+   real(wp), intent(in) :: emo(:, :)
+   real(wp), intent(in) :: focc(:, :)
+   integer, intent(in) :: range
+
+   character(len=*), parameter :: hlfmt = '(a21, f21.7, 1x, "Eh", f18.4, 1x, "eV")'
+   integer :: nao, maxorb, minorb, iorb, spin, homo
+   real(wp) :: gap, nel
+
+   do spin = 1, size(emo, 2)
+   nel = sum(focc(:, spin))
+   homo = floor(nel)
+   homo = merge(homo+1, homo, mod(nel, 1.0_wp) > 0.5_wp)
+   nao = size(emo, 1)
+   minorb = max(homo - (range+1), 1)
+   maxorb = min(homo +  range, nao)
+   gap = emo(min(homo+1, nao), spin) - emo(max(homo, 1), spin)
+
+   write(unit, '(66("-"))')
+   write(unit, "(a7, a14, a21, a21)") "#", "Occupation", "Energy/Eh", "Energy/eV"
+   write(unit, '(66("-"))')
+   if (minorb > 1) then
+      call write_line(1, focc(:, spin), emo(:, spin), homo)
+      if (minorb > 2) then
+        write(unit, "(a7, a14, a21, a21)") "...", "...", "...", "..."
+      end if
+   end if
+   do iorb = minorb, maxorb
+      call write_line(iorb, focc(:, spin), emo(:, spin), homo)
+   end do
+   if (maxorb < nao) then
+      if (maxorb < nao-1) then
+         if (focc(maxorb, spin) > sqrt(epsilon(1.0_wp))) then
+            write(unit, "(a7, a14, a21, a21)") "...", "...", "...", "..."
+         else
+            write(unit, "(a7, a14, a21, a21)") "...", "", "...", "..."
+         end if
+      end if
+      call write_line(nao, focc(:, spin), emo(:, spin), homo)
+   end if
+   write(unit, '(66("-"))')
+   write(unit, hlfmt) "HL-Gap", gap, gap*autoev
+   write(unit, '(66("-"))')
+   write(unit, "(a)")
+   end do
+
+contains
+   subroutine write_line(iorb, focc, emo, ihomo)
+      integer, intent(in) :: iorb
+      integer, intent(in) :: ihomo
+      real(wp), intent(in) :: focc(:)
+      real(wp), intent(in) :: emo (:)
+      character(len=*), parameter :: mofmt = "(i7, f14.4, f21.7, f21.4)"
+      character(len=*), parameter :: vofmt = "(i7, 14x,  f21.7, f21.4)"
+      if (focc(iorb) < 1.0e-7_wp) then
+         write(unit, vofmt, advance="no") iorb,             emo(iorb), emo(iorb)*autoev
+      else
+         write(unit, mofmt, advance="no") iorb, focc(iorb), emo(iorb), emo(iorb)*autoev
+      end if
+      if (iorb == ihomo) then
+         write(unit, '(1x, "(HOMO)")')
+      else if (iorb == ihomo+1) then
+         write(unit, '(1x, "(LUMO)")')
+      else
+         write(unit, "(a)")
+      end if
+   end subroutine write_line
+end subroutine ascii_levels
+
+subroutine ascii_dipole_moments(unit, verbosity, mol, dpat, dpmom)
+   integer, intent(in) :: unit
+   integer, intent(in) :: verbosity
+   type(structure_type), intent(in) :: mol
+   real(wp), intent(in) :: dpat(:, :)
+   real(wp), intent(in) :: dpmom(:)
+
+   integer :: iat, isp
+
+   write(unit, '(a,":")') "Atomic dipole moments (in atomic units)"
+   write(unit, '(57("-"))')
+   write(unit, "(a6, 1x, a4, 5x, *(1x, a12))") &
+      & "#", "Z", "x", "y", "z"
+   write(unit, '(57("-"))')
+   do iat = 1, mol%nat
+      isp = mol%id(iat)
+      write(unit, "(i6, 1x, i4, 1x, a4, *(1x, f12.6))") &
+         & iat, mol%num(isp), mol%sym(isp), dpat(:, iat)
+   end do
+   write(unit, '(57("-"))')
+   write(unit, "(1x, a15, *(1x, f12.6))") "total", dpmom
+   write(unit, '(57("-"))')
+   write(unit, "(a)")
+end subroutine ascii_dipole_moments
+
+subroutine ascii_atomic_charges(unit, verbosity, mol, qat)
+   integer, intent(in) :: unit
+   integer, intent(in) :: verbosity
+   type(structure_type), intent(in) :: mol
+   real(wp), intent(in) :: qat(:)
+
+   integer :: iat, isp
+
+   write(unit, '(a,":")') "Atomic charges (in atomic units)"
+   write(unit, '(57("-"))')
+   write(unit, "(a6, 1x, a4, 7x, *(1x, a10))") &
+      & "#", "Z", "q"
+   write(unit, '(57("-"))')
+   do iat = 1, mol%nat
+      isp = mol%id(iat)
+      write(unit, "(i6, 1x, i4, 1x, a4, *(1x, f12.6))") &
+         & iat, mol%num(isp), mol%sym(isp), qat(iat)
+   end do
+   write(unit, '(57("-"))')
+   write(unit, "(a)")
+end subroutine ascii_atomic_charges
+
+subroutine ascii_quadrupole_moments(unit, verbosity, mol, qpat, qpmom)
+   integer, intent(in) :: unit
+   integer, intent(in) :: verbosity
+   type(structure_type), intent(in) :: mol
+   real(wp), intent(in) :: qpat(:, :)
+   real(wp), intent(in) :: qpmom(:)
+
+   integer :: iat, isp
+
+   write(unit, '(a,":")') "Atomic quadrupole moments (in atomic units)"
+   write(unit, '(83("-"))')
+   write(unit, "(a6, 1x, a4, 5x, *(1x, a10))") &
+      & "#", "Z", "xx", "xy", "yy", "xz", "yz", "zz"
+   write(unit, '(83("-"))')
+   do iat = 1, mol%nat
+      isp = mol%id(iat)
+      write(unit, "(i6, 1x, i4, 1x, a4, *(1x, f10.4))") &
+         & iat, mol%num(isp), mol%sym(isp), qpat(:, iat)
+   end do
+   write(unit, '(83("-"))')
+   write(unit, "(1x, a15, *(1x, f10.4))") "total", qpmom
+   write(unit, '(83("-"))')
+   write(unit, "(a)")
+end subroutine ascii_quadrupole_moments
+
+
+subroutine ascii_vibrations(unit, frequencies, n_imag, n_rigid)
+   integer, intent(in) :: unit
+   real(wp), intent(in) :: frequencies(:)
+   integer, intent(in) :: n_imag, n_rigid
+
+   integer :: imode
+   character(len=32) :: character
+
+   if (n_imag == 0) then
+      character = "minimum"
+   else if (n_imag == 1) then
+      character = "first-order saddle point"
+   else
+      write(character, '(i0,1x,a)') n_imag, "imaginary modes"
+   end if
+
+   write(unit, '(a)') "Harmonic vibrational analysis:"
+   write(unit, '(55("-"))')
+   write(unit, '(a,1x,i0)') "Projected rigid-body modes:", n_rigid
+   write(unit, '(a,1x,i0)') "Imaginary modes (< -20 cm^-1):", n_imag
+   write(unit, '(a,1x,a)') "Harmonic characterization:", trim(character)
+   write(unit, '(55("-"))')
+   write(unit, '(a7,2x,a18)') "Mode", "Frequency / cm^-1"
+   write(unit, '(55("-"))')
+   do imode = 1, size(frequencies)
+      write(unit, '(i7,2x,f18.4)') imode, frequencies(imode)
+   end do
+   write(unit, '(55("-"))')
+   write(unit, '(a)')
+end subroutine ascii_vibrations
+
+
+subroutine json_results(unit, indentation, energy, gradient, sigma, energies, charges, &
+      & hessian, frequencies, normal_modes, n_imag, n_rigid)
+   integer, intent(in) :: unit
+   character(len=*), intent(in), optional :: indentation
+   real(wp), intent(in), optional :: energy
+   real(wp), intent(in), optional :: gradient(:, :)
+   real(wp), intent(in), optional :: sigma(:, :)
+   real(wp), intent(in), optional :: energies(:)
+   real(wp), intent(in), optional :: charges(:)
+   real(wp), intent(in), optional :: hessian(:, :)
+   real(wp), intent(in), optional :: frequencies(:)
+   real(wp), intent(in), optional :: normal_modes(:, :)
+   integer, intent(in), optional :: n_imag, n_rigid
+   character(len=:), allocatable :: indent, version_string
+   character(len=*), parameter :: jsonkey = "('""',a,'"":',1x)"
+   real(wp), allocatable :: array(:)
+
+   call get_tblite_version(string=version_string)
+
+   if (present(indentation)) then
+      indent = indentation
+   end if
+
+   write(unit, '("{")', advance="no")
+   if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+   write(unit, jsonkey, advance="no") "version"
+   write(unit, "(1x,a)", advance="no") '"'//version_string//'"'
+   if (present(energy)) then
+      write(unit, '(",")', advance="no")
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+      write(unit, jsonkey, advance="no") "energy"
+      write(unit, "(1x,es25.16)", advance="no") energy
+   end if
+   if (present(energies)) then
+      write(unit, '(",")', advance="no")
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+      write(unit, jsonkey, advance="no") "energies"
+      call write_json_array(unit, energies, indent)
+   end if
+   if (present(sigma)) then
+      write(unit, '(",")', advance="no")
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+      write(unit, jsonkey, advance="no") "virial"
+      array = reshape(sigma, [size(sigma)])
+      call write_json_array(unit, array, indent)
+   end if
+   if (present(gradient)) then
+      write(unit, '(",")', advance="no")
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+      write(unit, jsonkey, advance="no") "gradient"
+      array = reshape(gradient, [size(gradient)])
+      call write_json_array(unit, array, indent)
+   end if
+   if (present(charges)) then
+      write(unit, '(",")', advance="no")
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+      write(unit, jsonkey, advance="no") "charges"
+      array = reshape(charges, [size(charges)])
+      call write_json_array(unit, array, indent)
+   end if
+   if (present(hessian)) then
+      write(unit, '(",")', advance="no")
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+      write(unit, jsonkey, advance="no") "hessian"
+      array = reshape(hessian, [size(hessian)])
+      call write_json_array(unit, array, indent)
+   end if
+   if (present(frequencies)) then
+      write(unit, '(",")', advance="no")
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+      write(unit, jsonkey, advance="no") "frequencies"
+      call write_json_array(unit, frequencies, indent)
+   end if
+   if (present(normal_modes)) then
+      write(unit, '(",")', advance="no")
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+      write(unit, jsonkey, advance="no") "normal-modes"
+      array = reshape(normal_modes, [size(normal_modes)])
+      call write_json_array(unit, array, indent)
+   end if
+   if (present(n_imag)) then
+      write(unit, '(",")', advance="no")
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+      write(unit, jsonkey, advance="no") "n-imaginary"
+      write(unit, '(i0)', advance="no") n_imag
+   end if
+   if (present(n_rigid)) then
+      write(unit, '(",")', advance="no")
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+      write(unit, jsonkey, advance="no") "n-rigid"
+      write(unit, '(i0)', advance="no") n_rigid
+   end if
+   if (allocated(indent)) write(unit, "(/)", advance="no")
+   write(unit, '("}")')
+
+end subroutine json_results
+
+
+subroutine write_json_array(unit, array, indent)
+   integer, intent(in) :: unit
+   real(wp), intent(in) :: array(:)
+   character(len=:), allocatable, intent(in) :: indent
+   integer :: i
+   write(unit, '("[")', advance="no")
+   do i = 1, size(array)
+      if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 2)
+      write(unit, "(es23.16)", advance="no") array(i)
+      if (i /= size(array)) write(unit, '(",")', advance="no")
+   end do
+   if (allocated(indent)) write(unit, "(/,a)", advance="no") repeat(indent, 1)
+   write(unit, '("]")', advance="no")
+end subroutine write_json_array
+
+
+subroutine tagged_result(unit, energy, gradient, sigma, energies, hessian, frequencies, &
+      & normal_modes, n_imag, n_rigid)
+   integer, intent(in) :: unit
+   real(wp), intent(in), optional :: energy
+   real(wp), intent(in), optional :: gradient(:, :)
+   real(wp), intent(in), optional :: sigma(:, :)
+   real(wp), intent(in), optional :: energies(:)
+   real(wp), intent(in), optional :: hessian(:, :)
+   real(wp), intent(in), optional :: frequencies(:)
+   real(wp), intent(in), optional :: normal_modes(:, :)
+   integer, intent(in), optional :: n_imag, n_rigid
+   character(len=*), parameter :: tag_header = &
+      & '(a,t20,":",a,":",i0,":",*(i0:,","))'
+
+   if (present(energy)) then
+      write(unit, tag_header) "energy", "real", 0
+      write(unit, "(3es24.16)") energy
+   end if
+   if (present(energies)) then
+      write(unit, tag_header) "energies", "real", 1, shape(energies)
+      write(unit, "(3es24.16)") energies
+   end if
+   if (present(gradient)) then
+      write(unit, tag_header) "gradient", "real", 2, shape(gradient)
+      write(unit, "(3es24.16)") gradient
+   end if
+   if (present(sigma)) then
+      write(unit, tag_header) "virial", "real", 2, shape(sigma)
+      write(unit, "(3es24.16)") sigma
+   end if
+   if (present(hessian)) then
+      write(unit, tag_header) "hessian", "real", 2, shape(hessian)
+      write(unit, "(3es24.16)") hessian
+   end if
+   if (present(frequencies)) then
+      write(unit, tag_header) "frequencies", "real", 1, shape(frequencies)
+      write(unit, "(3es24.16)") frequencies
+   end if
+   if (present(normal_modes)) then
+      write(unit, tag_header) "normal-modes", "real", 2, shape(normal_modes)
+      write(unit, "(3es24.16)") normal_modes
+   end if
+   if (present(n_imag)) then
+      write(unit, tag_header) "n-imaginary", "integer", 0
+      write(unit, "(i0)") n_imag
+   end if
+   if (present(n_rigid)) then
+      write(unit, tag_header) "n-rigid", "integer", 0
+      write(unit, "(i0)") n_rigid
+   end if
+
+end subroutine tagged_result
+
+
+end module tblite_output_ascii
